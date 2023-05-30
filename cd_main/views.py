@@ -1,4 +1,5 @@
-from rest_framework.permissions import AllowAny
+from django.http import Http404
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.views import APIView
 from .serializers import *
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -89,11 +90,10 @@ class NotificationAPIView(generics.ListAPIView):
             Пример: https://collabdev.ru/notifications/?notifications_ids=2&notifications_ids=3&notification_status_ids=2
         Ответ: объекты Notification отвечающие параметрам запросов
     """
-    serializer_class = NotificationSerializer
+    serializer_class = NotificationWithUserSerializer
 
     def get_queryset(self):
         queryset = Notification.objects.all()
-
         key_words = self.request.query_params.get('key_words')
         if key_words is not None:
             for key_word in key_words:
@@ -132,11 +132,65 @@ class NotificationAPIView(generics.ListAPIView):
 
         return queryset.order_by(field)[offset: offset + limit: desk_ask]
 
+    #Запрос на вступление в проект
+    def post(self, serializer):
+        self.check_permissions(self.request)
+        response_user = ProjectSerializer(Project.objects.get(id=self.request.data.get('project'))).data.get('users')[0][
+            'id']
+        data = {'response_user': response_user, 'project': self.request.data.get('project'),
+                'request_user': self.request.user.id, 'text': self.request.data.get('text'),
+                'notification_status': 1}
+        try:
+            Notification.objects.get(request_user=data['request_user'], project=data['project'], notification_status=1)
+        except:
+            user_project_relation_serializer = NotificationSerializer(data=data)
+            if user_project_relation_serializer.is_valid():
+                user_project_relation_serializer.save()
+                return Response({'message': 'Запрос отправлен'}, status=status.HTTP_200_OK)
+            return Response({'message': 'Что пошло не так...'}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({'message': 'Запрос уже существует'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+class NotificationUpdateAPIView(generics.RetrieveUpdateAPIView):
+    """
+    API к оповещениям (обновление статуса оповещения)
+    в ответ на запрос отвечающий следующей спецификации:
+
+    PATCH '/notifications/{notification_id}' HTTP/1.1
+    Body json utf8 {
+        text: str, Optional
+        status_id: str, Optional
+    }
+    Response json utf8 {
+        notification_id: int
+    }
+    """
+    lookup_field = 'id'
+    queryset = Notification.objects.all()
+    serializer_class = NotificationUpdateSerializer
+    permission_classes = [IsAuthenticated]
+    def patch(self, request, *args, **kwargs):
+        self.check_permissions(self.request)
+        instance = self.get_object()
+        notification_id = kwargs.get('id')
+        notification = NotificationSerializer(instance)
+        if request.user.id == notification.data.get('response_user'):
+            self.update(request, *args, **kwargs)
+            data = {'notification_id': notification_id}
+            if self.request.data["notification_status"] == 2:
+                user_project_relation_serializer = UserProjectRelationSerializer(
+                    data={'user':  notification.data.get("request_user"), 'project': notification.data.get("project")})
+                if user_project_relation_serializer.is_valid():
+                    user_project_relation_serializer.save()
+            return Response(data, status=status.HTTP_200_OK)
+        return Response({'message': 'Пользователь не автор проекта'}, status=status.HTTP_400_BAD_REQUEST)
+
 
 class UserAPIView(generics.ListAPIView):
     """ API-ручка к пользователям User
         к запросу отвечающему следующей спецификации:
-
         GET '/users' HTTP/1.1
             Query:
                 user_ids: list[int], Optional - filter
@@ -145,11 +199,9 @@ class UserAPIView(generics.ListAPIView):
                 username: str, Optional - filter
                 email: str, Optional - filter
                 skills_ids: list[int], Optional - filter
-
                 order_by: str = 'fullname desc'
                 limit: int, Optional, default 10, max 10000
                 offset: int, Optional, default 0
-
             Response json utf-8 {
                 [
                     {
@@ -198,13 +250,20 @@ class UserAPIView(generics.ListAPIView):
         return queryset.filter(is_active__in=[True]).order_by(field)[offset: offset + limit: desk_ask]
 
 
-class UserDetailsView(generics.ListAPIView):
+#Возврат юзера с его проектами
+class UserDetailsView(generics.RetrieveAPIView):
     serializer_class = UserDetailsSerializer
 
-    def get_queryset(self):
+    def get_object(self):
         username = self.kwargs.get('username')
-        queryset = CustomUser.objects.filter(username=username)
-        return queryset
+        user = CustomUser.objects.get(username=username)
+        user_serializer = UserSerializer(user)
+        new_projects = Project.objects.all().filter(id__in=user_serializer.data.get('projects'), soft_delete__in=[False])
+        user.projects.set(new_projects)
+        queryset = user
+        if queryset is not None:
+            return user
+        raise Http404('Пользователь не найден')
 
 
 class ProjectAPIView(generics.ListAPIView, generics.ListCreateAPIView):
@@ -237,10 +296,15 @@ class ProjectOneAPIView(generics.RetrieveUpdateDestroyAPIView):
             return Response({'message': 'Project ID is not in user projects'}, status=status.HTTP_400_BAD_REQUEST)
 
     def delete(self, request, *args, **kwargs):
+        self.check_permissions(self.request)
         instance = self.get_object()
-        instance.soft_delete = True
-        instance.save()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        project = ProjectSerializer(instance)
+        if request.user.id == project.data.get('users')[0]['id']:
+            instance.soft_delete = True
+            instance.save()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        else:
+            return Response({'message': 'Project ID is not in user projects'}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class ProjectTypeAPIView(generics.ListAPIView):
